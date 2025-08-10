@@ -1,0 +1,898 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top">
+    <title>1on1ヒアリング支援アプリ (プロトタイプ)</title>
+    <!-- 軽量CSS。横スクロールと先頭列固定を実現 -->
+    <style>
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; padding-bottom: 22px; }
+      #table-scroller { overflow-x: auto; border: 1px solid #ddd; margin-top: 8px; }
+      table.sheet-grid { border-collapse: separate; border-spacing: 0; min-width: 1200px; table-layout: fixed; }
+      .sheet-grid th, .sheet-grid td { border: 1px solid #ccc; padding: 6px 8px; background: #fff; }
+      .sheet-grid thead th { position: sticky; top: 0; background: #f5f7fb; z-index: 3; }
+      .sticky-col { position: sticky; left: 0; background: #fdfdfd; z-index: 2; }
+      .sheet-grid thead th.sticky-col { z-index: 4; }
+      .caption { margin: 8px 0; color: #666; }
+      .toolbar { display: flex; gap: 12px; align-items: center; margin: 8px 0; }
+      .toolbar .status { color: #666; font-size: 12px; }
+      .filter-input { width: 100%; box-sizing: border-box; padding: 4px 6px; }
+      .cell-input { width: 100%; box-sizing: border-box; padding: 4px 6px; border: 1px solid #ccc; border-radius: 2px; }
+      .cell-select { width: 100%; box-sizing: border-box; padding: 4px 6px; }
+      .th-sort { cursor: pointer; user-select: none; }
+      .th-sort .arrow { margin-left: 4px; font-size: 10px; color: #888; }
+      /* 列幅リサイズ用ハンドル */
+      .th-resizer { position: absolute; top: 0; right: 0; width: 6px; height: 100%; cursor: col-resize; user-select: none; }
+      .sheet-grid thead th { position: sticky; } /* resizerのためposition指定（stickyは既存） */
+      .loading { color: #666; }
+      .error { color: #b00020; }
+      /* 画面下部の同期スクロールバー */
+      #bottom-scrollbar { position: fixed; left: 0; right: 0; bottom: 0; height: 16px; overflow-x: auto; overflow-y: hidden; background: #fff; border-top: 1px solid #ddd; z-index: 10; }
+      #bottom-scrollbar .inner { height: 1px; }
+      /* 多行エディタ（ポップオーバー） */
+      .ml-editor { position: fixed; z-index: 1000; background: #fff; border: 1px solid #ccc; box-shadow: 0 4px 12px rgba(0,0,0,.15); padding: 8px; border-radius: 6px; }
+      .ml-editor .editor-textarea { width: 520px; max-width: 76vw; height: 200px; box-sizing: border-box; }
+      .ml-editor .editor-actions { margin-top: 6px; display: flex; gap: 8px; justify-content: flex-end; align-items: center; }
+      .ml-editor .hint { font-size: 12px; color: #666; margin-right: auto; }
+      .ml-editor-overlay { position: fixed; inset: 0; z-index: 999; background: transparent; }
+    </style>
+  </head>
+  <body>
+    <h1>1on1ヒアリング支援アプリ (プロトタイプ)</h1>
+    
+    <!-- 1. 支店（シート）選択プルダウン -->
+    <div id="sheet-selector-container">
+      <label for="sheet-select">表示する支店を選択してください:</label>
+      <select id="sheet-select">
+        <option value="">読み込み中...</option>
+      </select>
+      <a id="open-selected-sheet" href="#" target="_blank" rel="noopener" style="margin-left:8px;">スプレッドシートを開く</a>
+    </div>
+
+    <hr>
+
+    <!-- 2. 選択されたシートのデータがここに表として表示されます -->
+    <div class="toolbar">
+      <div id="status" class="status"></div>
+      <div id="actions"></div>
+    </div>
+
+    <div id="data-table-container">
+      <!-- ここにWeb版スプレッドシートが表示されます -->
+    </div>
+
+    <!-- GASサーバーサイド関数を呼び出すためのJavaScript -->
+    <script>
+      /**
+       * ページの読み込みが完了したときに実行される処理です。
+       */
+      document.addEventListener('DOMContentLoaded', () => {
+        // List!A+B から作成したリンク一覧を取得します。
+        google.script.run
+          .withSuccessHandler(populateBranchSelector) // 成功したらプルダウン生成
+          .withFailureHandler(onFailure)              // 失敗時の処理
+          .getBranchLinks();
+      });
+
+      /**
+       * List!A+B から受け取ったリンク配列でプルダウンを作成します。
+       * @param {{label:string,url:string}[]|{error:string}} links
+       */
+      function populateBranchSelector(links) {
+        if (links && links.error) { alert(links.error); return; }
+
+        const selectElement = document.getElementById('sheet-select');
+        selectElement.innerHTML = '';
+        const openLink = document.getElementById('open-selected-sheet');
+
+        const initialOption = document.createElement('option');
+        initialOption.value = '';
+        initialOption.textContent = '支店を選択してください';
+        selectElement.appendChild(initialOption);
+
+        (links || []).forEach(item => {
+          const option = document.createElement('option');
+          option.value = item.url;         // 値=リンクURL
+          option.textContent = item.label; // 表示=会社名 支店名
+          selectElement.appendChild(option);
+        });
+
+        // 初期は開くリンクを無効化
+        if (openLink) { openLink.href = '#'; openLink.style.pointerEvents = 'none'; openLink.style.opacity = '0.5'; }
+
+        selectElement.addEventListener('change', (event) => {
+          const url = event.target.value;
+          if (openLink) {
+            if (url) { openLink.href = url; openLink.style.pointerEvents = 'auto'; openLink.style.opacity = '1'; }
+            else { openLink.href = '#'; openLink.style.pointerEvents = 'none'; openLink.style.opacity = '0.5'; }
+          }
+          if (url) loadSheet(url);
+        });
+      }
+
+      /**
+       * 選択URLからスプレッドシートのデータを取得し、表を描画します。
+       * @param {string} url
+       */
+      function loadSheet(url) {
+        const container = document.getElementById('data-table-container');
+        container.textContent = '';
+        const status = document.getElementById('status');
+        status.textContent = '読み込み中...';
+        google.script.run
+          .withSuccessHandler((data) => { status.textContent = ''; renderEditableGrid(url, data); })
+          .withFailureHandler((err) => { status.textContent = ''; onFailure(err); })
+          .getSheetDataWithSchemaFromUrl(url);
+      }
+
+      /**
+       * データを表で表示します。
+       * @param {{sheetName:string,headers:string[],rows:string[][]}|{error:string}} data
+       */
+      /**
+       * 編集可能グリッドを描画します（横スクロール、先頭列固定、ソート/フィルタ、プルダウン/日付入力、保存連動）。
+       * @param {string} url - 連動するスプレッドシートURL
+       * @param {{sheetName:string,headers:string[],rows:string[][],dropdownByCol:Object,dateIsoByCol:Object,sheetUrl?:string,linksByCol?:Object,checkboxByCol?:Object,checkboxStateByCol?:Object}|{error:string}} data
+       */
+      function renderEditableGrid(url, data) {
+        const container = document.getElementById('data-table-container');
+        if (data && data.error) { container.textContent = data.error; return; }
+
+        const { sheetName, headers, rows, dropdownByCol = {}, dateIsoByCol = {}, sheetUrl, linksByCol = {}, checkboxByCol = {}, checkboxStateByCol = {} } = data || {};
+        if (!headers || headers.length === 0) {
+          container.textContent = 'データがありません。';
+          return;
+        }
+
+        // 状態管理オブジェクト
+        /** @type {{
+         *  currentUrl:string,
+         *  headers:string[],
+         *  rows:string[][],
+         *  dropdownByCol:Object,
+         *  dateIsoByCol:Object,
+         *  sort:{col:number|null,dir:'asc'|'desc'|null},
+         *  filters:{[col:number]:string},
+         *  viewRowIndices:number[],
+         *  frozenColIndex:number|null
+         * }} */
+        const state = {
+          currentUrl: sheetUrl || url,
+          sheetName: sheetName || '',
+          headers: headers.slice(),
+          rows: (rows || []).map(r => r.slice()),
+          dropdownByCol,
+          dateIsoByCol,
+          linksByCol,
+          checkboxByCol,
+          checkboxStateByCol,
+          sort: { col: null, dir: null },
+          filters: {},
+          viewRowIndices: [],
+          frozenColIndex: findFrozenColIndex(headers)
+        };
+
+        // 初期ビュー計算
+        recomputeView();
+
+        // キャプション
+        container.innerHTML = '';
+        const caption = document.createElement('div');
+        caption.className = 'caption';
+        const openHref = sheetUrl || url;
+        // 安全なDOM組み立てでリンクを作成（XSS対策）
+        const labelNode = document.createTextNode('シート: ');
+        const aNode = document.createElement('a');
+        aNode.href = openHref;
+        aNode.target = '_blank';
+        aNode.rel = 'noopener';
+        aNode.textContent = sheetName;
+        caption.appendChild(labelNode);
+        caption.appendChild(aNode);
+        container.appendChild(caption);
+
+        // アクション（タブ切替）
+        const actionsDiv = document.getElementById('actions');
+        if (actionsDiv) {
+          actionsDiv.innerHTML = '';
+          const btnFront = document.createElement('button');
+          btnFront.textContent = 'フロント担当者を開く';
+          btnFront.addEventListener('click', () => openTab('フロント担当者'));
+          actionsDiv.appendChild(btnFront);
+
+          const btnMain = document.createElement('button');
+          btnMain.textContent = '1on1を開く';
+          btnMain.addEventListener('click', () => openTab('1on1'));
+          actionsDiv.appendChild(btnMain);
+
+          const btnResetWidth = document.createElement('button');
+          btnResetWidth.textContent = '列幅リセット';
+          btnResetWidth.addEventListener('click', () => resetColumnWidths());
+          actionsDiv.appendChild(btnResetWidth);
+        }
+
+        // スクロールコンテナ
+        const scroller = document.createElement('div');
+        scroller.id = 'table-scroller';
+        container.appendChild(scroller);
+
+        // 画面下部の同期スクロールバー（固定表示）を用意
+        let bottomBar = document.getElementById('bottom-scrollbar');
+        if (!bottomBar) {
+          bottomBar = document.createElement('div');
+          bottomBar.id = 'bottom-scrollbar';
+          const inner = document.createElement('div');
+          inner.className = 'inner';
+          bottomBar.appendChild(inner);
+          document.body.appendChild(bottomBar);
+        }
+        const bottomInner = bottomBar.querySelector('.inner');
+        let syncingScroll = false; // 相互更新の無限ループ防止
+        scroller.addEventListener('scroll', () => {
+          if (syncingScroll) return; syncingScroll = true;
+          bottomBar.scrollLeft = scroller.scrollLeft;
+          syncingScroll = false;
+        }, { passive: true });
+        bottomBar.addEventListener('scroll', () => {
+          if (syncingScroll) return; syncingScroll = true;
+          scroller.scrollLeft = bottomBar.scrollLeft;
+          syncingScroll = false;
+        }, { passive: true });
+
+        // 列幅永続化のためのキー
+        const widthStorageKey = `colWidths:${state.currentUrl}`;
+        /**
+         * 保存済みの列幅マップを取得します。
+         * @returns {{[colIndex:string]: number}}
+         */
+        function loadSavedWidths() {
+          try {
+            const s = localStorage.getItem(widthStorageKey);
+            return s ? JSON.parse(s) : {};
+          } catch (_) { return {}; }
+        }
+        /**
+         * 列幅(px)を保存します。
+         * @param {number} colIdx
+         * @param {number} px
+         */
+        function saveWidth(colIdx, px) {
+          try {
+            const map = loadSavedWidths();
+            map[String(colIdx)] = Math.max(60, Math.floor(px));
+            localStorage.setItem(widthStorageKey, JSON.stringify(map));
+          } catch (_) { /* noop */ }
+        }
+        /**
+         * 列幅をリセットし、同一タブを再読込します。
+         */
+        function resetColumnWidths() {
+          try { localStorage.removeItem(widthStorageKey); } catch (_) {}
+          const status = document.getElementById('status');
+          status.textContent = '列幅を初期化して再読込中...';
+          // currentUrl は gid 付き URL のため、同一タブを再取得できる
+          google.script.run
+            .withSuccessHandler((d) => { status.textContent = ''; renderEditableGrid(state.currentUrl, d); })
+            .withFailureHandler((err) => { status.textContent = ''; onFailure(err); })
+            .getSheetDataWithSchemaFromUrl(state.currentUrl);
+        }
+
+        // テーブル構築
+        const table = document.createElement('table');
+        table.className = 'sheet-grid';
+        scroller.appendChild(table);
+
+        const thead = document.createElement('thead');
+        const trHead = document.createElement('tr');
+        // 視覚上の列順（固定列を先頭へ移動）
+        const allCols = headers.map((_, i) => i);
+        const colOrder = (state.frozenColIndex != null)
+          ? [state.frozenColIndex, ...allCols.filter(i => i !== state.frozenColIndex)]
+          : allCols.slice();
+        // 非表示にする列（ヘッダ名一致）
+        const HIDDEN_HEADER_NAMES = new Set(['ID']);
+        const hiddenColSet = new Set(headers.map((h, i) => ((h || '').trim()) ).map((name, i) => ({name, i}))
+          .filter(obj => HIDDEN_HEADER_NAMES.has(obj.name)).map(obj => obj.i));
+        const visibleColOrder = colOrder.filter(i => !hiddenColSet.has(i));
+
+        // 列幅制御のため colgroup を生成
+        const colgroup = document.createElement('colgroup');
+        const savedWidths = loadSavedWidths();
+        visibleColOrder.forEach((origColIdx) => {
+          const col = document.createElement('col');
+          col.dataset.col = String(origColIdx);
+          // デフォルト幅をヘッダ/値/型から推定
+          const saved = savedWidths && savedWidths.hasOwnProperty(String(origColIdx)) ? Number(savedWidths[String(origColIdx)]) : null;
+          const w = isFinite(saved) && saved > 0 ? saved : computeDefaultColWidthPx(origColIdx);
+          col.style.width = w + 'px';
+          colgroup.appendChild(col);
+        });
+        table.appendChild(colgroup);
+        // 初期テーブル幅を列幅の合計に設定（横スクロール有効化）
+        updateTableWidth();
+
+        visibleColOrder.forEach((origColIdx) => {
+          const th = document.createElement('th');
+          th.className = 'th-sort';
+          th.dataset.col = String(origColIdx);
+          if (state.frozenColIndex === origColIdx) th.classList.add('sticky-col');
+          const title = document.createElement('span');
+          title.textContent = headers[origColIdx] || '';
+          const arrow = document.createElement('span');
+          arrow.className = 'arrow';
+          th.appendChild(title);
+          th.appendChild(arrow);
+          th.addEventListener('click', () => toggleSort(origColIdx));
+          // リサイズハンドル
+          const resizer = document.createElement('span');
+          resizer.className = 'th-resizer';
+          resizer.addEventListener('mousedown', (e) => initResize(e, th, origColIdx));
+          th.appendChild(resizer);
+          trHead.appendChild(th);
+        });
+        thead.appendChild(trHead);
+
+        // フィルター行
+        const trFilter = document.createElement('tr');
+        visibleColOrder.forEach((origColIdx) => {
+          const th = document.createElement('th');
+          if (state.frozenColIndex === origColIdx) th.classList.add('sticky-col');
+          const input = document.createElement('input');
+          input.type = 'text';
+          input.placeholder = 'フィルター';
+          input.className = 'filter-input';
+          input.addEventListener('input', () => { state.filters[origColIdx] = input.value || ''; recomputeView(); renderBody(); });
+          th.appendChild(input);
+          trFilter.appendChild(th);
+        });
+        thead.appendChild(trFilter);
+        table.appendChild(thead);
+
+        const tbody = document.createElement('tbody');
+        table.appendChild(tbody);
+
+        // 初回レンダリング
+        updateSortArrows();
+        renderBody();
+
+        /**
+         * ビュー行インデックスを再計算（フィルタ→ソート順）。
+         */
+        function recomputeView() {
+          const total = state.rows.length;
+          let idx = [...Array(total).keys()];
+          // フィルタ適用
+          idx = idx.filter(r => {
+            for (const [cStr, v] of Object.entries(state.filters)) {
+              const c = Number(cStr);
+              if (v && !String(state.rows[r][c] || '').toLowerCase().includes(String(v).toLowerCase())) return false;
+            }
+            return true;
+          });
+          // ソート適用
+          if (state.sort.col != null && state.sort.dir) {
+            const c = state.sort.col;
+            const dir = state.sort.dir === 'asc' ? 1 : -1;
+            idx.sort((a, b) => String(state.rows[a][c] || '').localeCompare(String(state.rows[b][c] || '')) * dir);
+          }
+          state.viewRowIndices = idx;
+        }
+
+        /** 更新後、矢印を描画 */
+        function updateSortArrows() {
+          const ths = trHead.querySelectorAll('th');
+          ths.forEach((th) => {
+            const arrow = th.querySelector('.arrow');
+            if (!arrow) return;
+            const orig = Number(th.dataset.col || -1);
+            if (state.sort.col === orig) {
+              arrow.textContent = state.sort.dir === 'asc' ? '▲' : '▼';
+            } else {
+              arrow.textContent = '';
+            }
+          });
+        }
+
+        /** ヘッダクリックでソートトグル */
+        function toggleSort(colIdx) {
+          if (state.sort.col === colIdx) {
+            state.sort.dir = state.sort.dir === 'asc' ? 'desc' : (state.sort.dir === 'desc' ? null : 'asc');
+            if (state.sort.dir === null) state.sort.col = null;
+          } else {
+            state.sort.col = colIdx; state.sort.dir = 'asc';
+          }
+          recomputeView(); updateSortArrows(); renderBody();
+        }
+
+        /**
+         * 指定タブを開く（同一スプレッドシート内）。
+         * @param {string} tabName - 開きたいタブ名（例: 'フロント担当者', '1on1'）
+         */
+        function openTab(tabName) {
+          const status = document.getElementById('status');
+          status.textContent = '読み込み中...';
+          google.script.run
+            .withSuccessHandler((tabData) => { status.textContent = ''; renderEditableGrid(url, tabData); })
+            .withFailureHandler((err) => { status.textContent = ''; onFailure(err); })
+            .getTabDataWithSchemaFromUrl(url, tabName);
+        }
+
+        /** 先頭固定列のインデックスを見つける（ヘッダ名「マンション名」）。見つからなければnull */
+        function findFrozenColIndex(hdrs) {
+          const idx = hdrs.findIndex(h => (h || '').trim() === 'マンション名');
+          return idx >= 0 ? idx : null;
+        }
+
+        /** 日付カラムか判定（ヘッダが「理事会日」または dateIsoByCol に含まれる） */
+        function isDateColumn(colIdx) {
+          const name = (state.headers[colIdx] || '').trim();
+          if (name === '理事会日') return true;
+          return Object.prototype.hasOwnProperty.call(state.dateIsoByCol, colIdx);
+        }
+
+        /** ヘッダが「面談済み」または「面談済」か判定（テキスト列→疑似チェックボックス対応。1on1の「面談状況」は含めない） */
+        function headerIsMendanZumi(colIdx) {
+          const name = (state.headers[colIdx] || '').trim();
+          return name === '面談済み' || name === '面談済';
+        }
+
+        /**
+         * チェックボックスカラムか判定します。
+         * @param {number} colIdx - 列インデックス（0基準）
+         * @returns {boolean}
+         */
+        function isCheckboxColumn(colIdx) {
+          return Object.prototype.hasOwnProperty.call(state.checkboxByCol || {}, colIdx) || headerIsMendanZumi(colIdx);
+        }
+
+        /**
+         * 読取専用カラムかを判定します（「マンション名」「住所」を固定）。
+         * @param {number} colIdx - 列インデックス（0基準）
+         * @returns {boolean}
+         */
+        function isReadOnlyColumn(colIdx) {
+          const name = (state.headers[colIdx] || '').trim();
+          // 常時ReadOnlyな列
+          if (name === 'マンション名' || name === '住所') return true;
+          // 1on1タブでは「面談状況」を編集不可（数式破壊防止）。常に表示のみ。
+          if ((state.sheetName || '').trim() === '1on1' && name === '面談状況') return true;
+          return false;
+        }
+
+        /** 単行表示用の整形（改行→空白） */
+        function summarizeSingleLine(s) { return String(s || '').replace(/\r\n|\r|\n/g, ' '); }
+
+        /**
+         * 多行エディタ（小モーダル）をセル付近に表示して編集します。
+         * Shift+Enterで改行、Enterで保存、Escでキャンセル。
+         * @param {number} dataRow
+         * @param {number} colIdx
+         * @param {HTMLElement} anchorEl
+         * @param {string} initialValue
+         * @param {{insertNewlineAt?:number}=} opts
+         */
+        function openMultilineEditor(dataRow, colIdx, anchorEl, initialValue, opts) {
+          try {
+            const rect = anchorEl.getBoundingClientRect();
+            // クリック外キャンセル用のオーバーレイ
+            const overlay = document.createElement('div');
+            overlay.className = 'ml-editor-overlay';
+            document.body.appendChild(overlay);
+            const editor = document.createElement('div');
+            editor.className = 'ml-editor';
+            const ta = document.createElement('textarea');
+            ta.className = 'editor-textarea';
+            let val = String(initialValue || '');
+            const insertPos = opts && typeof opts.insertNewlineAt === 'number' ? opts.insertNewlineAt : null;
+            if (insertPos != null && insertPos >= 0 && insertPos <= val.length) {
+              val = val.slice(0, insertPos) + '\n' + val.slice(insertPos);
+            }
+            ta.value = val;
+
+            const actions = document.createElement('div');
+            actions.className = 'editor-actions';
+            const hint = document.createElement('div');
+            hint.className = 'hint';
+            hint.textContent = 'Shift+Enterで改行 / Enterで保存 / Escでキャンセル';
+            const btnCancel = document.createElement('button');
+            btnCancel.textContent = 'キャンセル';
+            const btnSave = document.createElement('button');
+            btnSave.textContent = '保存';
+
+            actions.appendChild(hint);
+            actions.appendChild(btnCancel);
+            actions.appendChild(btnSave);
+            editor.appendChild(ta);
+            editor.appendChild(actions);
+            document.body.appendChild(editor);
+
+            // 位置（簡易）：セル直下、画面外にはみ出さないよう調整
+            const vw = window.innerWidth || document.documentElement.clientWidth;
+            const left = Math.max(8, Math.min(rect.left, vw - 560));
+            const top = Math.max(8, rect.bottom + 6);
+            editor.style.left = left + 'px';
+            editor.style.top = top + 'px';
+
+            function cleanup() {
+              document.removeEventListener('keydown', onDocKey);
+              if (editor && editor.parentNode) editor.parentNode.removeChild(editor);
+              if (overlay && overlay.parentNode) overlay.parentNode.removeChild(overlay);
+            }
+            function doSave() {
+              const normalized = String(ta.value || '').replace(/\r\n/g, '\n');
+              // 可視input要素（anchorEl）をcontrolElに渡すことで、失敗時のUIロールバックを確実にする
+              applyEdit(dataRow, colIdx, normalized, anchorEl);
+              // 一行表示を即時更新
+              if (anchorEl) {
+                anchorEl.value = summarizeSingleLine(normalized);
+                anchorEl.title = normalized;
+              }
+              cleanup();
+            }
+            function onDocKey(ev) {
+              if (ev.key === 'Escape') { ev.preventDefault(); cleanup(); }
+            }
+            document.addEventListener('keydown', onDocKey, { passive: false });
+
+            ta.addEventListener('keydown', (e) => {
+              if (e.key === 'Enter' && e.shiftKey) {
+                e.preventDefault();
+                const start = ta.selectionStart || 0;
+                const end = ta.selectionEnd || 0;
+                const cur = ta.value;
+                ta.value = cur.slice(0, start) + '\n' + cur.slice(end);
+                const pos = start + 1;
+                ta.setSelectionRange(pos, pos);
+              } else if (e.key === 'Enter') {
+                e.preventDefault();
+                doSave();
+              } else if (e.key === 'Escape') {
+                e.preventDefault();
+                cleanup();
+              }
+            }, { passive: false });
+
+            btnCancel.addEventListener('click', cleanup);
+            btnSave.addEventListener('click', doSave);
+            overlay.addEventListener('click', cleanup);
+
+            // フォーカス・キャレット位置
+            ta.focus();
+            if (insertPos != null) {
+              const pos = Math.min(insertPos + 1, ta.value.length);
+              ta.setSelectionRange(pos, pos);
+            } else {
+              const end = ta.value.length;
+              ta.setSelectionRange(end, end);
+            }
+          } catch (_) { /* noop */ }
+        }
+
+        /**
+         * tbodyを再描画（編集コントロールを生成）。
+         */
+        function renderBody() {
+          tbody.innerHTML = '';
+          for (let viewRow = 0; viewRow < state.viewRowIndices.length; viewRow++) {
+            const dataRow = state.viewRowIndices[viewRow];
+            const tr = document.createElement('tr');
+            visibleColOrder.forEach((origColIdx) => {
+              const td = document.createElement('td');
+              if (state.frozenColIndex === origColIdx) td.classList.add('sticky-col');
+              const isDropdown = Object.prototype.hasOwnProperty.call(state.dropdownByCol, origColIdx);
+              const isDate = isDateColumn(origColIdx);
+              const readOnly = isReadOnlyColumn(origColIdx);
+              const isCheckbox = isCheckboxColumn(origColIdx);
+
+              if (readOnly) {
+                const headerName = (state.headers[origColIdx] || '').trim();
+                const text = state.rows[dataRow][origColIdx] || '';
+                if (headerName === 'マンション名') {
+                  const linkArr = (state.linksByCol && state.linksByCol[origColIdx]) ? state.linksByCol[origColIdx] : [];
+                  const href = linkArr && linkArr[dataRow] ? linkArr[dataRow] : '';
+                  if (href) {
+                    const a = document.createElement('a');
+                    a.href = href; a.textContent = text; a.target = '_blank'; a.rel = 'noopener';
+                    td.appendChild(a);
+                  } else {
+                    td.textContent = text;
+                  }
+                } else {
+                  td.textContent = text;
+                }
+              } else if (isCheckbox) {
+                const cb = document.createElement('input');
+                cb.type = 'checkbox';
+                const states = state.checkboxStateByCol[origColIdx] || [];
+                let checked = !!states[dataRow];
+                // バックエンドでcheckboxStateが無い場合は表示値から推定（面談済み列フォールバック）
+                if (!states.length && headerIsMendanZumi(origColIdx)) {
+                  const cellVal = String(state.rows[dataRow][origColIdx] || '').trim();
+                  checked = (cellVal === '済' || cellVal.toUpperCase() === 'TRUE' || cellVal === '○' || cellVal === '◯');
+                }
+                cb.checked = checked;
+                cb.addEventListener('change', () => applyEdit(dataRow, origColIdx, cb.checked, cb));
+                td.appendChild(cb);
+              } else if (isDropdown) {
+                const select = document.createElement('select');
+                select.className = 'cell-select';
+                const options = state.dropdownByCol[origColIdx] || [];
+                // 現在値を先頭に含める（未定義値への対処）
+                const current = state.rows[dataRow][origColIdx] || '';
+                const unique = Array.from(new Set([current, ...options]));
+                unique.forEach(v => {
+                  const opt = document.createElement('option');
+                  opt.value = v; opt.textContent = v; if (v === current) opt.selected = true; select.appendChild(opt);
+                });
+                select.addEventListener('change', () => applyEdit(dataRow, origColIdx, select.value, select));
+                td.appendChild(select);
+              } else if (isDate) {
+                const input = document.createElement('input');
+                input.type = 'date';
+                input.className = 'cell-input';
+                const isoArr = state.dateIsoByCol[origColIdx] || [];
+                input.value = isoArr[dataRow] || '';
+                input.addEventListener('change', () => applyEdit(dataRow, origColIdx, input.value || '', input));
+                td.appendChild(input);
+              } else {
+                const input = document.createElement('input');
+                input.type = 'text';
+                input.className = 'cell-input';
+                const raw = state.rows[dataRow][origColIdx] || '';
+                input.value = summarizeSingleLine(raw);
+                if (raw) input.title = raw; // ツールチップで全文を確認可能
+                input.addEventListener('change', () => applyEdit(dataRow, origColIdx, input.value, input));
+                // ダブルクリックで多行エディタを開く
+                input.addEventListener('dblclick', () => {
+                  const latest = state.rows[dataRow][origColIdx] || '';
+                  openMultilineEditor(dataRow, origColIdx, input, latest);
+                });
+                // Shift+Enterで多行エディタを開き、その場で改行を挿入
+                input.addEventListener('keydown', (e) => {
+                  if (e.key === 'Enter' && e.shiftKey) {
+                    e.preventDefault();
+                    const pos = typeof input.selectionStart === 'number' ? input.selectionStart : (String(input.value || '').length);
+                    // 初期値にはstate上の生文字列を使う（改行保持のため）
+                    const init = state.rows[dataRow][origColIdx] || '';
+                    openMultilineEditor(dataRow, origColIdx, input, init, { insertNewlineAt: pos });
+                  }
+                });
+                td.appendChild(input);
+              }
+              tr.appendChild(td);
+            });
+            tbody.appendChild(tr);
+          }
+        }
+
+        /**
+         * デフォルト列幅(px)を推定します。
+         * ヘッダ長・先頭N行の値・型（プルダウン/日付）に基づく簡易ヒューリスティック。[SF][RP]
+         * @param {number} origColIdx - 元の列インデックス
+         * @returns {number} 推定幅(px)
+         */
+        function computeDefaultColWidthPx(origColIdx) {
+          const header = (state.headers[origColIdx] || '').trim();
+          const isFrozen = state.frozenColIndex === origColIdx;
+          const isDropdown = Object.prototype.hasOwnProperty.call(state.dropdownByCol, origColIdx);
+          const isDate = isDateColumn(origColIdx);
+
+          // 型ごとの基準幅
+          if (isDate) return 120; // yyyy-MM-dd などの幅
+          if (isDropdown) {
+            const opts = state.dropdownByCol[origColIdx] || [];
+            const maxOptLen = Math.max(0, ...opts.map(s => String(s).length));
+            return clamp(110, maxOptLen * 12 + 32, 260);
+          }
+          if (header === 'マンション名' || isFrozen) {
+            const maxLen = Math.max(header.length, sampleMaxLen(origColIdx, 50));
+            return clamp(180, maxLen * 14 + 40, 360);
+          }
+          // 数値カラムの簡易判定（先頭N行のうち数値率が高い場合）
+          const numericRatio = estimateNumericRatio(origColIdx, 50);
+          if (numericRatio >= 0.7) {
+            const maxLen = Math.max(header.length, sampleMaxLen(origColIdx, 50));
+            return clamp(90, maxLen * 10 + 28, 180);
+          }
+          // デフォルト：ヘッダ/値の長い方で推定
+          const maxLen = Math.max(header.length, sampleMaxLen(origColIdx, 50));
+          return clamp(100, maxLen * 12 + 32, 320);
+        }
+
+        /**
+         * 先頭N件の表示行から、当該列の値の最大文字数を返す。
+         * @param {number} origColIdx
+         * @param {number} limit
+         * @returns {number}
+         */
+        function sampleMaxLen(origColIdx, limit) {
+          let max = 0; const idxs = state.viewRowIndices;
+          for (let i = 0; i < Math.min(limit, idxs.length); i++) {
+            const r = idxs[i];
+            const s = String(state.rows[r][origColIdx] || '');
+            if (s.length > max) max = s.length;
+          }
+          return max;
+        }
+
+        /**
+         * 先頭N件の表示行で数値判定に該当する比率を返す。
+         * @param {number} origColIdx
+         * @param {number} limit
+         * @returns {number} 0..1
+         */
+        function estimateNumericRatio(origColIdx, limit) {
+          let cnt = 0, numCnt = 0; const idxs = state.viewRowIndices;
+          for (let i = 0; i < Math.min(limit, idxs.length); i++) {
+            const r = idxs[i];
+            const s = String(state.rows[r][origColIdx] || '').trim();
+            if (!s) continue; cnt++;
+            if (/^[+-]?(\d{1,3}(,\d{3})*|\d+)(\.\d+)?$/.test(s)) numCnt++;
+          }
+          return cnt ? numCnt / cnt : 0;
+        }
+
+        /** 値を[min,max]に丸め込み */
+        function clamp(min, v, max) { return Math.max(min, Math.min(max, v)); }
+
+        /**
+         * 列幅リサイズ開始（ヘッダ右端のハンドルをドラッグ）
+         * @param {MouseEvent} e
+         * @param {HTMLTableCellElement} thEl - 対象ヘッダ
+         * @param {number} origColIdx - 元の列インデックス
+         */
+        function initResize(e, thEl, origColIdx) {
+          e.preventDefault();
+          e.stopPropagation();
+          const startX = e.clientX;
+          const startWidth = thEl.getBoundingClientRect().width;
+          const colEl = table.querySelector(`col[data-col="${origColIdx}"]`);
+          const minWidth = 60; // 最小幅
+
+          function onMove(ev) {
+            const dx = ev.clientX - startX;
+            const newW = Math.max(minWidth, startWidth + dx);
+            if (colEl) colEl.style.width = newW + 'px';
+            // sticky列の位置は先頭で left:0 のため追加計算不要
+            updateTableWidth(); // 合計幅を更新し、他列を縮めずに横スクロール
+          }
+          function onUp() {
+            window.removeEventListener('mousemove', onMove);
+            window.removeEventListener('mouseup', onUp);
+            // 現在の幅を保存
+            const w = parseFloat(String(colEl && colEl.style.width || '').replace('px',''));
+            if (!isNaN(w)) saveWidth(origColIdx, w);
+          }
+          window.addEventListener('mousemove', onMove);
+          window.addEventListener('mouseup', onUp);
+        }
+
+        /**
+         * すべての可視列の幅(px)合計をテーブル幅に反映し、
+         * リサイズ時に他列が縮まらないようにする。
+         */
+        function updateTableWidth() {
+          const cols = table.querySelectorAll('col');
+          let sum = 0;
+          cols.forEach(col => {
+            const w = parseFloat(String(col.style.width || '').replace('px',''));
+            sum += isNaN(w) ? 120 : w; // 未設定時は120px相当
+          });
+          const min = 1200; // 既定の最小幅
+          const total = Math.max(sum, min);
+          table.style.width = total + 'px';
+          // 下部スクロールバーの幅/表示を同期
+          if (bottomInner) bottomInner.style.width = total + 'px';
+          if (bottomBar) {
+            const shouldShow = total > scroller.clientWidth;
+            bottomBar.style.display = shouldShow ? 'block' : 'none';
+          }
+        }
+
+        // 画面リサイズ時も下部スクロールバーの表示状態を更新
+        window.addEventListener('resize', () => { updateTableWidth(); }, { passive: true });
+
+        /**
+         * セル更新をGASへ反映し、ローカル状態も更新。
+         * @param {number} dataRow - オリジナル行インデックス（0基準、ヘッダ除く）
+         * @param {number} colIdx - 列インデックス（0基準）
+         * @param {string} value - 新しい値（yyyy-MM-ddは日付として保存）
+         */
+        function applyEdit(dataRow, colIdx, value, controlEl) {
+          const status = document.getElementById('status');
+          status.textContent = '保存中...';
+
+          // 楽観的更新
+          const prevValue = state.rows[dataRow][colIdx] || '';
+          const isCk = isCheckboxColumn(colIdx);
+          let prevChecked = null;
+          if (isCk) {
+            const arr = state.checkboxStateByCol[colIdx] || [];
+            prevChecked = !!arr[dataRow];
+            arr[dataRow] = !!value;
+            state.checkboxStateByCol[colIdx] = arr;
+            // 面談済み列は『済/空』で表示・保存
+            const displayForCheckbox = headerIsMendanZumi(colIdx) ? (value ? '済' : '') : (value ? 'TRUE' : 'FALSE');
+            state.rows[dataRow][colIdx] = displayForCheckbox;
+          } else {
+            state.rows[dataRow][colIdx] = value;
+          }
+          if (isDateColumn(colIdx)) {
+            const isoArr = state.dateIsoByCol[colIdx] || [];
+            const prevIso = isoArr[dataRow] || '';
+            isoArr[dataRow] = value || '';
+            state.dateIsoByCol[colIdx] = isoArr;
+            controlEl && (controlEl.dataset.prevDisplay = prevIso);
+          } else if (isCk) {
+            controlEl && (controlEl.dataset.prevDisplay = prevValue);
+            if (controlEl) controlEl.dataset.prevChecked = String(prevChecked);
+          } else {
+            controlEl && (controlEl.dataset.prevDisplay = prevValue);
+          }
+
+          // 送信値：実チェックボックス列は boolean、フォールバック（面談済みテキスト列）は『済/空』
+          let sendValue = value;
+          if (isCk) {
+            const backendIsCheckbox = Object.prototype.hasOwnProperty.call(state.checkboxByCol || {}, colIdx);
+            if (headerIsMendanZumi(colIdx) && !backendIsCheckbox) {
+              sendValue = value ? '済' : '';
+            } else {
+              sendValue = !!value;
+            }
+          }
+          const edits = [{ rowIndex: dataRow, colIndex: colIdx, value: sendValue }];
+          google.script.run
+            .withSuccessHandler((res) => {
+              if (res && res.error) {
+                // ロールバック
+                state.rows[dataRow][colIdx] = prevValue;
+                if (isDateColumn(colIdx)) {
+                  const isoArr = state.dateIsoByCol[colIdx] || [];
+                  isoArr[dataRow] = controlEl ? (controlEl.dataset.prevDisplay || '') : '';
+                  state.dateIsoByCol[colIdx] = isoArr;
+                } else if (isCk) {
+                  const arr = state.checkboxStateByCol[colIdx] || [];
+                  const pv = controlEl && controlEl.dataset.prevChecked ? (controlEl.dataset.prevChecked === 'true') : false;
+                  arr[dataRow] = pv;
+                  state.checkboxStateByCol[colIdx] = arr;
+                  if (controlEl && controlEl.type === 'checkbox') controlEl.checked = pv;
+                }
+                if (controlEl && controlEl.type !== 'checkbox') controlEl.value = controlEl.dataset.prevDisplay || prevValue;
+                status.textContent = 'エラー: ' + res.error;
+              } else {
+                status.textContent = '保存しました';
+                setTimeout(() => { if (status.textContent === '保存しました') status.textContent = ''; }, 1000);
+              }
+            })
+            .withFailureHandler((err) => {
+              // ロールバック
+              state.rows[dataRow][colIdx] = prevValue;
+              if (isDateColumn(colIdx)) {
+                const isoArr = state.dateIsoByCol[colIdx] || [];
+                isoArr[dataRow] = controlEl ? (controlEl.dataset.prevDisplay || '') : '';
+                state.dateIsoByCol[colIdx] = isoArr;
+              } else if (isCk) {
+                const arr = state.checkboxStateByCol[colIdx] || [];
+                const pv = controlEl && controlEl.dataset.prevChecked ? (controlEl.dataset.prevChecked === 'true') : false;
+                arr[dataRow] = pv;
+                state.checkboxStateByCol[colIdx] = arr;
+                if (controlEl && controlEl.type === 'checkbox') controlEl.checked = pv;
+              }
+              if (controlEl && controlEl.type !== 'checkbox') controlEl.value = controlEl.dataset.prevDisplay || prevValue;
+              status.textContent = '';
+              onFailure(err);
+            })
+            .applyEdits(state.currentUrl, edits);
+        }
+      }
+
+      /**
+       * GASの関数呼び出しが失敗したときに呼び出されるコールバック関数です。
+       * @param {Error} error - GASから返されたエラーオブジェクト
+       */
+      function onFailure(error) {
+        // アラートでエラーメッセージを表示します。
+        alert('エラーが発生しました: ' + (error && error.message ? error.message : error));
+      }
+    </script>
+  </body>
+</html>
